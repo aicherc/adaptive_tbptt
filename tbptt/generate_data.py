@@ -159,7 +159,11 @@ def plot_sequence(Yhat, Ytrue, color=None):
     import matplotlib.pyplot as plt
     seq_len, num_states = Yhat.shape
     if color is None:
-        color = ['C{0}'.format(ii) for ii in range(num_states)]
+        if num_states < 8:
+            color = ['C{0}'.format(ii) for ii in range(num_states)]
+        else:
+            import seaborn as sns
+            color = sns.color_palette('husl', num_states)
 
     fig, ax = plt.subplots(1,1)
     Yprob = np.exp(Yhat) / np.outer(np.sum(np.exp(Yhat), axis=1),

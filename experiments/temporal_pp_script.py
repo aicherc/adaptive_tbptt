@@ -13,14 +13,20 @@ import pandas as pd
 import joblib
 from tqdm import tqdm
 
-import synth_model
+from temporal_pp_model import (
+        TPP_loss_generator,
+        zero_one_loss_y_map_predict,
+        t_mean_predict,
+        rmse_t_mean_predict,
+        RNNModel_onehot,
+        RNNModel,
+        process_data_onehot,
+        process_data,
+        )
 
 from tbptt import (
     TBPTT_minibatch_helper,
-    generate_repeating_sequence,
-    generate_copy_sequence,
-    plot_repeating_sequence,
-    plot_copy_sequence,
+    plot_sequence,
     )
 from tbptt.adaptive_truncation import (
     calculate_gradient_norms,
@@ -35,33 +41,31 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Modified from pytorch/examples/word_language_model on Github
-parser = argparse.ArgumentParser(description='PyTorch Synthetic RNN Model')
+parser = argparse.ArgumentParser(description='PyTorch Temporal Point Process Model')
 # I/O args
 parser.add_argument("--experiment_id", type=int, default=-1)
 parser.add_argument("--experiment_folder", type=str, default='test')
-
 # Data Args
-parser.add_argument("--data_name", type=str, default='./data/test',
-                    help="name of dataset to save/load data")
-parser.add_argument("--data_type", type=str, default='copy',
-                    help="{'repeat', 'copy'}")
-parser.add_argument("--data_lag", type=int, default=10,
-                    help="data 'lag' or memory parameter",
-                    )
-parser.add_argument("--data_minlag", type=int, default=5,
-                    help="data minimum 'lag' or memory parameter (for COPY)",
-                    )
-parser.add_argument('--emsize', type=int, default=6,
-                    help="dimension of inputs and outputs",
-                    )
+parser.add_argument('--data_path', type=str,
+            help='location of data (e.g. "event-#-train.txt" or "time-#-train.txt)')
+parser.add_argument('--data_split_number', type=int, default=1,
+            help='which split number (of Du 2016)')
+parser.add_argument('--data_time_scale', type=float, default=1,
+            help="scaling for temporal data",
+            )
 
 # Model Args
 parser.add_argument('--model', type=str, default='LSTM',
                     help='type of recurrent net (RNN_TANH, RNN_RELU, LSTM, GRU)')
-parser.add_argument('--nhid', type=int, default=20,
+parser.add_argument('--emsize', type=int, default=128,
+                    help='size of event embeddings')
+parser.add_argument('--nhid', type=int, default=128,
                     help='number of hidden units per layer')
 parser.add_argument('--nlayers', type=int, default=2,
                     help='number of layers')
+parser.add_argument('--time_onehot_split', action='store_true',
+            help="include onehot vector for new segement",
+            )
 
 # Training Args
 parser.add_argument('--lr', type=float, default=20,
@@ -82,9 +86,9 @@ parser.add_argument('--max_train_time', type=float, default=3*3600,
                     help='max training time')
 parser.add_argument('--batch_size', type=int, default=64,
                     help='batch size')
-parser.add_argument("--tbptt_style", type=str, default='original_buffer',
+parser.add_argument("--tbptt_style", type=str, default='original-buffer',
         help="One of (tf, buffer, original, original-buffer, double-tf)")
-parser.add_argument('--K', type=int, default=50,
+parser.add_argument('--K', type=int, default=10,
                     help='TBPTT sequence length')
 parser.add_argument('--adaptive_K', action='store_true',
                     help='use adaptive K')
@@ -98,28 +102,26 @@ parser.add_argument('--seed', type=int, default=None,
                     help='random seed')
 parser.add_argument('--init_num', type=int, default=0,
                     help='initial parameters')
-parser.add_argument("--init_path", type=str, default=None,
-                    help='init_num path (default is experiment_folder/out/)')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
 args = parser.parse_args()
 print(args)
+if not args.time_onehot_split:
+    raise ValueError("--time_onehot_split must be True")
 
 # Additional Training CONSTs
-TRAIN_SEQ_LEN = 4000
-TEST_SEQ_LEN = 1000
 TP_SEQ_LEN = 500
 MAX_TRAIN_STEPS = 600
 MAX_TIME_PER_STEP = 20
 MAX_STEPS_PER_STEP = 10
-NUM_K_EST_REPS = 20
-TAUS_RANGE = np.arange(60, 91, 10)
+NUM_K_EST_REPS = 10
+TAUS_RANGE = np.arange(10, 91, 10)
 MIN_K = 2
 MAX_K = 100
 CHECK_FREQ = 30
 GRAD_CHECK_FREQ = 30
 GRAD_CHECK_SEQ_LEN = 100
-K_EST_SEQ_LEN = 100
+K_EST_SEQ_LEN = 200
 
 # Set the random seed manually for reproducibility.
 if args.seed is None:
@@ -145,108 +147,87 @@ path_to_out = os.path.join(args.experiment_folder, 'out', method_name)
 if not os.path.isdir(path_to_out):
     os.makedirs(path_to_out)
 joblib.dump(pd.DataFrame([vars(args)]), os.path.join(path_to_out, 'options.p'))
-if args.init_path is None:
-    path_to_init_param_dict = os.path.join(args.experiment_folder, 'out',
-            "init_{0}.state_dict.pth".format(args.init_num))
-else:
-    path_to_init_param_dict = os.path.join(args.init_path,
-            "init_{0}.state_dict.pth".format(args.init_num))
+path_to_init_param_dict = os.path.join(args.experiment_folder, 'out',
+        "init_{0}.state_dict.pth".format(args.init_num))
 path_to_check_param_dict = os.path.join(path_to_out,"checkpoint_state_dict.pth")
 
 
 ###############################################################################
 # Load/Generate data
 ###############################################################################
-print("Loading/Generate Data")
+print("Loading Data")
 
-path_to_data_folder = os.path.join(args.data_name)
-if not os.path.isdir(path_to_data_folder):
-    os.makedirs(path_to_data_folder)
-path_to_data = os.path.join(path_to_data_folder,
-        '{0}_{1}_{2}.p.gz'.format(args.data_type, args.data_lag, args.emsize))
+# Process Train Data
+if not os.path.isdir(args.data_path):
+    raise ValueError("Could not find {0}".format(args.data_path))
 
-if os.path.isfile(path_to_data):
-    print("Loading Data from {0}".format(path_to_data))
-    data = joblib.load(path_to_data)
-
+if args.time_onehot_split:
+    process_data_func = process_data_onehot
 else:
-    print("Generating Data")
-    if args.data_type == 'repeat':
-        train_data = generate_repeating_sequence(
-            seq_len = TRAIN_SEQ_LEN,
-            batch_size = args.batch_size,
-            input_size = args.emsize,
-            output_size = args.emsize,
-            lag = args.data_lag,
-            base_seq_length = TRAIN_SEQ_LEN,
-            )
-        valid_data = generate_repeating_sequence( seq_len = TEST_SEQ_LEN,
-            batch_size = args.batch_size,
-            input_size = args.emsize,
-            output_size = args.emsize,
-            lag = args.data_lag,
-            base_seq_length = TEST_SEQ_LEN,
-            )
-        test_data = generate_repeating_sequence(
-            seq_len = TEST_SEQ_LEN,
-            batch_size = args.batch_size,
-            input_size = args.emsize,
-            output_size = args.emsize,
-            lag = args.data_lag,
-            base_seq_length = TEST_SEQ_LEN,
-            )
-    elif args.data_type == 'copy':
-        train_data = generate_copy_sequence(
-            seq_len = TRAIN_SEQ_LEN,
-            batch_size = args.batch_size,
-            num_states = args.emsize,
-            lag = args.data_lag,
-            min_lag = args.data_minlag,
-            )
-        valid_data = generate_copy_sequence(
-            seq_len = TEST_SEQ_LEN,
-            batch_size = args.batch_size,
-            num_states = args.emsize,
-            lag = args.data_lag,
-            min_lag = args.data_minlag,
-            )
-        test_data = generate_copy_sequence(
-            seq_len = TEST_SEQ_LEN,
-            batch_size = args.batch_size,
-            num_states = args.emsize,
-            lag = args.data_lag,
-            min_lag = args.data_minlag,
-            )
-    else:
-        raise ValueError("Unrecognized 'data_type' {0}".format(
-            args.data_type))
+    process_data_func = process_data
 
-    train_X = torch.tensor(train_data['input_seq'], dtype=torch.float32)
-    train_Y = torch.tensor(train_data['output_seq'], dtype=torch.long)
-    valid_X = torch.tensor(valid_data['input_seq'], dtype=torch.float32)
-    valid_Y = torch.tensor(valid_data['output_seq'], dtype=torch.long)
-    test_X = torch.tensor(test_data['input_seq'], dtype=torch.float32)
-    test_Y = torch.tensor(test_data['output_seq'], dtype=torch.long)
+print("Training Data")
+X_train, Y_train, num_train_events = process_data_func(
+        path_to_event=os.path.join(args.data_path,
+            'event-{0}-train.txt'.format(args.data_split_number)),
+        path_to_time=os.path.join(args.data_path,
+            'time-{0}-train.txt'.format(args.data_split_number)),
+        time_scale = args.data_time_scale,
+        )
+print("Valid/Test Data")
+X_test, Y_test, num_test_events = process_data_func(
+        path_to_event=os.path.join(args.data_path,
+            'event-{0}-test.txt'.format(args.data_split_number)),
+        path_to_time=os.path.join(args.data_path,
+            'time-{0}-test.txt'.format(args.data_split_number)),
+        time_scale = args.data_time_scale,
+        )
+X_valid, X_test = X_test[:X_test.shape[0]//2], X_test[X_test.shape[0]//2:]
+Y_valid, Y_test = Y_test[:Y_test.shape[0]//2], Y_test[Y_test.shape[0]//2:]
 
-    data = dict(train_X=train_X, train_Y=train_Y,
-                valid_X=valid_X, valid_Y=valid_Y,
-                test_X=test_X, test_Y=test_Y,
-                )
-    print("Saving Data to {0}".format(path_to_data))
-    joblib.dump(data, path_to_data)
+num_events = np.max([num_train_events, num_test_events])
 
-# Move data to device
-for key in ['train_X', 'train_Y', 'valid_X', 'valid_Y', 'test_X', 'test_Y']:
-    data[key] = data[key].to(device)
-train_data = dict(X = data['train_X'], Y = data['train_Y'])
-valid_data = dict(X = data['valid_X'], Y = data['valid_Y'])
-test_data = dict(X = data['test_X'], Y = data['test_Y'])
+
+# Move data to device in batches
+X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+Y_train = torch.tensor(Y_train, dtype=torch.float32).to(device)
+X_valid = torch.tensor(X_valid, dtype=torch.float32).to(device)
+Y_valid = torch.tensor(Y_valid, dtype=torch.float32).to(device)
+X_test = torch.tensor(X_test, dtype=torch.float32).to(device)
+Y_test = torch.tensor(Y_test, dtype=torch.float32).to(device)
+
+def batchify(data, bsz):
+    # Work out how cleanly we can divide the dataset into bsz parts.
+    nbatch = data.size(0) // bsz
+    # Trim off any extra elements that wouldn't cleanly fit (remainders).
+    data = data.narrow(0, 0, nbatch * bsz)
+    # Evenly divide the data across the bsz batches.
+    data = data.view(bsz, -1, data.size(1)).permute(1,0,2).contiguous()
+    return data.to(device)
+
+train_data = dict(X = batchify(X_train, args.batch_size),
+                  Y = batchify(Y_train, args.batch_size))
+valid_data = dict(X = batchify(X_valid, args.batch_size),
+                  Y = batchify(Y_valid, args.batch_size))
+test_data = dict(X = batchify(X_test, args.batch_size),
+                  Y = batchify(Y_test, args.batch_size))
 
 ###############################################################################
 # Build the model
 ###############################################################################
 print("Setting Up Model Module")
-rnn_module = synth_model.RNNModel(args.model, args.emsize, args.emsize, args.nhid, args.nlayers, args.dropout).to(device)
+if args.time_onehot_split:
+    Model = RNNModel_onehot
+else:
+    Model = RNNModel
+rnn_module = Model(
+        rnn_type=args.model,
+        nout=num_events,
+        ninp=train_data['X'].size(2),
+        emsize=args.emsize,
+        nhid=args.nhid,
+        nlayers=args.nlayers,
+        dropout=args.dropout).to(device)
 
 # Copy Initialization between different TBPTT(K) methods
 if os.path.isfile(path_to_check_param_dict):
@@ -292,7 +273,7 @@ elif args.optim == 'Momentum':
             )
 else:
     raise ValueError("Unrecognized optim: {0}".format(args.optim))
-loss_module = nn.CrossEntropyLoss()
+loss_module = TPP_loss_generator(w=rnn_module.t_decoder.weight)
 
 # Minibatch Helper (calls train() + eval())
 runner = TBPTT_minibatch_helper(
@@ -320,7 +301,7 @@ def get_batch(source, start, seq_len):
     return X, Y
 
 def stochastic_subset(source, seq_len):
-    """ Subsample seq_len uniformly for each element along dim 1 """
+    """ Subsample seq_len uniformly for each element along dim 1 of X """
     shifts=np.random.randint(0, source['X'].shape[0]-seq_len, size=source['X'].shape[1])
     subset_X = torch.cat([source['X'][shift:shift+seq_len,ii:ii+1]
         for (ii, shift) in enumerate(shifts)], dim=1)
@@ -419,7 +400,7 @@ def calc_metric_estimate(source, runner,
 
 def checkpoint_grad_plots(runner, source, path_to_figures,
         taus = TAUS_RANGE, seq_len=GRAD_CHECK_SEQ_LEN,
-        start=0, burnin=50):
+        start=0, burnin=2):
     plt.close('all')
     train_X, train_Y = get_batch(
             source=source, start=start, seq_len=seq_len+2*burnin,
@@ -638,22 +619,35 @@ def checkpoint_metric_plots(metric_df, path_to_figures, path_to_out):
         plt.close('all')
     return
 
-
-def checkpoint_fit_plots(runner, data, path_to_figures, plot_sequence):
-    seq_len, burnin = 50, 10
-    train_X, train_Y = data['train_X'], data['train_Y']
-    test_X, test_Y = data['test_X'], data['test_Y']
+def checkpoint_fit_plots(runner, train_data, test_data, path_to_figures, plot_sequence):
+    seq_len, burnin = 120, 20
+    train_X, train_Y = train_data['X'], train_data['Y']
+    test_X, test_Y = test_data['X'], test_data['Y']
 
     plt.close('all')
     train_Yhat = runner.predict(train_X[0:seq_len],
-            runner.rnn_module.get_default_init(train_X.shape[1]))
-    fig, ax = plot_sequence(train_Yhat[burnin:, 0], train_Y[burnin:seq_len,0].cpu().numpy())
-    fig.savefig(os.path.join(path_to_figures, "model_fit_train.png"))
+            runner.rnn_module.get_default_init(train_X.shape[1]))[:,:,:-1]
+    fig, ax = plot_sequence(train_Yhat[burnin:, 0], train_Y[burnin:seq_len,0,0].cpu().numpy())
+    fig.savefig(os.path.join(path_to_figures, "model_fit_y_train.png"))
+    train_dt_hat, train_dt_true = t_mean_predict(train_Yhat[:,:1], train_Y[0:seq_len,:1],
+            w=runner.rnn_module.t_decoder.weight)
+    fig, ax = plt.subplots(1,1)
+    ax.plot(train_dt_true, '.C0', label='dt truth')
+    ax.plot(train_dt_hat, '.C1', label='dt hat')
+    ax.legend()
+    fig.savefig(os.path.join(path_to_figures, "model_fit_dt_train.png"))
 
     test_Yhat = runner.predict(test_X[0:seq_len],
-            runner.rnn_module.get_default_init(train_X.shape[1]))
-    fig, ax = plot_sequence(test_Yhat[burnin:,0], test_Y[burnin:seq_len,0].cpu().numpy())
-    fig.savefig(os.path.join(path_to_figures, "model_fit_test.png"))
+            runner.rnn_module.get_default_init(train_X.shape[1]))[:,:,:-1]
+    fig, ax = plot_sequence(test_Yhat[burnin:,0], test_Y[burnin:seq_len,0,0].cpu().numpy())
+    fig.savefig(os.path.join(path_to_figures, "model_fit_y_test.png"))
+    test_dt_hat, test_dt_true = t_mean_predict(test_Yhat[:,:1], test_Y[0:seq_len,:1],
+            w=runner.rnn_module.t_decoder.weight)
+    fig, ax = plt.subplots(1,1)
+    ax.plot(test_dt_true, '.C0', label='dt truth')
+    ax.plot(test_dt_hat, '.C1', label='dt hat')
+    ax.legend()
+    fig.savefig(os.path.join(path_to_figures, "model_fit_dt_test.png"))
     plt.close('all')
     return
 
@@ -732,6 +726,33 @@ for step in pbar:
             #tqdm=tqdm,
             )/test_Y.size(0)
 
+    # Compute Extra Metrics
+    extra_seq_len = 10000
+    extra_burnin = 20
+    valid_Y_predict = runner.predict(valid_X[:extra_seq_len+extra_burnin],
+            rnn_module.get_default_init(valid_X.shape[1]))
+    valid_01_y_loss = zero_one_loss_y_map_predict(
+            valid_Y_predict[extra_burnin:],
+            valid_Y[extra_burnin:extra_seq_len+extra_burnin],
+            )
+    valid_rmse_t_loss = rmse_t_mean_predict(
+            valid_Y_predict[extra_burnin:],
+            valid_Y[extra_burnin:extra_seq_len+extra_burnin],
+            w=runner.rnn_module.t_decoder.weight,
+            )
+
+    test_Y_predict = runner.predict(test_X[:extra_seq_len+extra_burnin],
+            rnn_module.get_default_init(test_X.shape[1]))
+    test_01_y_loss = zero_one_loss_y_map_predict(
+            test_Y_predict[extra_burnin:],
+            test_Y[extra_burnin:extra_seq_len+extra_burnin],
+            )
+    test_rmse_t_loss = rmse_t_mean_predict(
+            test_Y_predict[extra_burnin:],
+            test_Y[extra_burnin:extra_seq_len+extra_burnin],
+            w=runner.rnn_module.t_decoder.weight,
+            )
+
     metric_ests = [None] * NUM_K_EST_REPS
     for est_rep in range(NUM_K_EST_REPS):
         #tqdm(range(NUM_K_EST_REPS), desc="K_est_rep"):
@@ -744,15 +765,17 @@ for step in pbar:
     if args.adaptive_K:
         Khat = np.mean([metric_est['K_{0}'.format(args.delta)] for metric_est in metric_ests])
     pbar.set_description(
-            "Epoch: {0:2.1f}, Valid Loss: {1:4.4f}, Test Loss: {2:4.4f}, Test PPL: {3:4.4f}, Cur K: {4:2d}, Khat: {5:3.2f}, K_0.5: {6:2d}, Train Time: {7:4.2f}, LR: {8:4.2f}".format(
-            epoch, valid_loss, test_loss, np.exp(test_loss), K, Khat, relK, cur_train_time, lr,
+            "Epoch: {0:2.1f}, Valid Loss: {1:4.4f}, Test Loss: {2:4.4f}, Valid Y_01: {3:4.4f}, Valid dt_RMSE {4:4.4f}, Cur K: {5:2d}, Khat: {6:3.2f}, K_0.5: {7:2d}, Train Time: {8:4.2f}, LR: {9:4.2f}".format(
+            epoch, valid_loss, test_loss, valid_01_y_loss, valid_rmse_t_loss, K, Khat, relK, cur_train_time, lr,
             ))
 
     metric = [
-            dict(metric = 'valid_log_ppl', value = valid_loss),
-            dict(metric = 'test_log_loss', value = test_loss),
-            dict(metric = 'valid_ppl', value = np.exp(valid_loss)),
-            dict(metric = 'test_ppl', value = np.exp(test_loss)),
+            dict(metric = 'valid_negloglike', value = valid_loss),
+            dict(metric = 'test_negloglike', value = test_loss),
+            dict(metric = 'valid_y_01', value = valid_01_y_loss),
+            dict(metric = 'test_y_01', value = test_01_y_loss),
+            dict(metric = 'valid_t_rmse', value = valid_rmse_t_loss),
+            dict(metric = 'test_t_rmse', value = test_rmse_t_loss),
             dict(metric = 'cur_K', value = K),
             dict(metric = 'Khat', value = Khat),
             ] + [
@@ -780,8 +803,7 @@ for step in pbar:
         print("Quick Checkpoint Epoch:{0}      ".format(epoch_str))
         checkpoint_metric_plots(metric_df, path_to_figures, path_to_out)
 
-        plot_sequence = plot_copy_sequence if args.data_type == 'copy' else plot_repeating_sequence
-        checkpoint_fit_plots(runner, data, path_to_figures, plot_sequence)
+        checkpoint_fit_plots(runner, train_data, test_data, path_to_figures, plot_sequence)
         if (step % GRAD_CHECK_FREQ == 0) or exit_flag:
             checkpoint_grad_plots(runner, train_data, path_to_figures)
 
@@ -797,7 +819,7 @@ for step in pbar:
         start_time = time.time()
         seq_len = K_EST_SEQ_LEN
         tau = seq_len-20
-        burnin = 20
+        burnin = 2
         K_ests = adaptive_K_est(train_data,
                 runner,
                 seq_len=seq_len,

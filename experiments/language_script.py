@@ -53,6 +53,8 @@ parser.add_argument('--tied', action='store_true',
 # Training Args
 parser.add_argument('--lr', type=float, default=20,
                     help='initial learning rate')
+parser.add_argument('--optim', type=str, default='SGD',
+                    help='optimizer {SGD (default), ADADELTA, Momentum}')
 parser.add_argument('--scale_lr_K', action='store_true',
                     help='scale learning rate by K')
 parser.add_argument('--decay_lr', action='store_true',
@@ -61,7 +63,7 @@ parser.add_argument('--weight_decay', type=float, default=10**-6,
                     help='L2 regularization')
 parser.add_argument('--clip_grad', type=float, default=1.0,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=35,
+parser.add_argument('--epochs', type=int, default=50,
                     help='upper epoch limit')
 parser.add_argument('--max_train_time', type=float, default=3*3600,
                     help='max training time')
@@ -196,11 +198,27 @@ else:
     metric_df = []
 
 # Loss + Optimizer
-optimizer = torch.optim.SGD(
-        rnn_module.parameters(),
-        lr = args.lr,
-        weight_decay = args.weight_decay,
-        )
+if args.optim == 'SGD':
+    optimizer = torch.optim.SGD(
+            rnn_module.parameters(),
+            lr = args.lr,
+            weight_decay = args.weight_decay,
+            )
+elif args.optim == 'ADADELTA':
+    optimizer = torch.optim.Adadelta(
+            rnn_module.parameters(),
+            lr = args.lr,
+            weight_decay = args.weight_decay,
+            )
+elif args.optim == 'Momentum':
+    optimizer = torch.optim.SGD(
+            rnn_module.parameters(),
+            lr = args.lr,
+            weight_decay = args.weight_decay,
+            momentum = 0.9,
+            )
+else:
+    raise ValueError("Unrecognized optim: {0}".format(args.optim))
 loss_module = nn.CrossEntropyLoss()
 
 # Minibatch Helper (calls train() + eval())

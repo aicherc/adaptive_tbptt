@@ -1,10 +1,10 @@
 # Adaptive Truncated Backpropagation Through Time
 > This is PyTorch code for Adaptive TBPTT used for training RNN
 
-This repo contains the python code for the experiments in [Adaptively Truncating Backpropagation Through Time to Control Gradient Bias]() by Christopher Aicher, Nicholas J. Foti, and Emily B. Fox.
+This repo contains the python code for the experiments in [Adaptively Truncating Backpropagation Through Time to Control Gradient Bias](https://arxiv.org/abs/1905.07473) by Christopher Aicher, Nicholas J. Foti, and Emily B. Fox. UAI 2019.
 
 ## Overview
-* The `data` folder stores the synthetic and language model data.
+* The `data` folder stores the synthetic, language model, and temporal point process data.
 * The `scripts` folder stores the bash scripts for the experiments.
 * The `experiments` folder contains the python code for experiment scripts. See `experiments/README.md` for additional details.
 * The `tbptt` folder contains the python module code. See `tbptt/README.md` for additional details.
@@ -22,7 +22,13 @@ cd <path_to_repo>
 ./get_lm_data
 ```
 
-To run the experiment scripts run the experiment bash scripts
+To download the temporal point process data call `get_tpp_data.sh`.
+```
+cd <path_to_repo>
+./get_tpp_data
+```
+
+To run the experiment scripts, call individual experiment bash scripts
 ```
 cd <path_to_repo>
 ./scripts/<experiment_name>.sh
@@ -46,6 +52,10 @@ python ./experiments/script_maker.py
 
 ## Release History / Changelog
 
+* 0.2.0
+    * The second release (July 2019)
+    * Added temporal point process modeling
+    * Updated scripts to use multiple initializations
 * 0.1.0
     * The first release (May 2019)
 
