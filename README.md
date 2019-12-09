@@ -61,7 +61,7 @@ python ./experiments/script_maker.py
 
 ## Meta
 
-Christopher Aicher – aicherc@uw.com
+Christopher Aicher – aicherc@uw.edu
 
 Distributed under the MIT license. See ``LICENSE`` for more information.
 
